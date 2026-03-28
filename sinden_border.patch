@@ -1,0 +1,188 @@
+diff --git a/PSX.sv b/PSX.sv
+index 8ca384f..f22f71a 100644
+--- a/PSX.sv
++++ b/PSX.sv
+@@ -387,6 +387,8 @@ parameter CONF_STR = {
+ 	"P1-;",
+ 	"P1O[33:32],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+ 	"P1O[35:34],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
++	"P1O[95:94],Sinden Border,Off,Auto,On;",
++	"P1O[98:96],Sinden Border Width,1,2,3,4,5,6,7,8;",
+ 	"P1-;",
+ 	"DEP1O[62],Fixed HBlank,On,Off;",
+ 	"DEP1O[55],Fixed VBlank,Off,On;",
+@@ -880,12 +882,14 @@ wire PadPortJustif2  = (status[52:49] == 4'b1001);
+ wire snacPort2       = (status[52:49] == 4'b1010) && ~multitap;
+ wire PadPortStick2   = (status[52:49] == 4'b1011);
+ wire PadPortPopn2    = (status[52:49] == 4'b1100);
++wire sinden_border_need = PadPortGunCon1 | PadPortGunCon2 | snacPort1 | snacPort2;
+ 
+ reg paddleMode = 0;
+ reg paddleMin = 0;
+ reg paddleMax = 0;
+ wire [7:0] joy0_xmuxed = (paddleMode) ? (paddle_0 - 8'd128) : joystick_analog_l0[7:0];
+ 
++
+ // to activate paddleMode negcon mode must be active and paddle must best moved
+ always @(posedge clk_1x) begin
+    if (PadPortNeGcon1) begin
+@@ -1538,12 +1542,50 @@ vid_info video_aspect;
+ vid_info video_gamma;
+ 
+ assign CE_PIXEL = ce_pix;
+-assign VGA_R    = video_gamma.red;
+-assign VGA_G    = video_gamma.green;
+-assign VGA_B    = video_gamma.blue;
+-assign VGA_VS   = video_gamma.vs;
+-assign VGA_HS   = video_gamma.hs;
+-assign VGA_DE   = ~(video_gamma.vb | video_gamma.hb);
++
++// --- Sinden border controls (Off/Auto/On + thickness 1..8)
++wire [1:0] sinden_border_mode = status[95:94];               // 0=Off, 1=Auto, 2=On, 3=On
++wire [3:0] sinden_border_px   = {1'b0, status[98:96]} + 4'd1; // 1..8
++wire sinden_border_en_eff     =
++    sinden_border_mode[1] ? 1'b1 :                            // 2 or 3 => On
++    (sinden_border_mode[0] ? sinden_border_need : 1'b0);       // 1 => Auto, 0 => Off
++
++// Raw (pre-border) VGA from gamma stage
++wire [7:0] vga_r_raw  = video_gamma.red;
++wire [7:0] vga_g_raw  = video_gamma.green;
++wire [7:0] vga_b_raw  = video_gamma.blue;
++wire       vga_hs_raw = video_gamma.hs;
++wire       vga_vs_raw = video_gamma.vs;
++wire       vga_de_raw = ~(video_gamma.vb | video_gamma.hb);
++
++// Border-processed outputs
++wire [7:0] vga_r_b, vga_g_b, vga_b_b;
++wire       vga_de_b;
++
++sinden_border_overlay border_i (
++    .clk       (CLK_VIDEO),
++    .ce_pix    (CE_PIXEL),
++    .hs        (vga_hs_raw),
++    .vs        (vga_vs_raw),
++    .de_in     (vga_de_raw),
++    .r_in      (vga_r_raw),
++    .g_in      (vga_g_raw),
++    .b_in      (vga_b_raw),
++    .border_en (sinden_border_en_eff),
++    .border_px (sinden_border_px),
++    .de_out    (vga_de_b),
++    .r_out     (vga_r_b),
++    .g_out     (vga_g_b),
++    .b_out     (vga_b_b)
++);
++
++// Final outputs (timing unchanged)
++assign VGA_R  = vga_r_b;
++assign VGA_G  = vga_g_b;
++assign VGA_B  = vga_b_b;
++assign VGA_HS = vga_hs_raw;
++assign VGA_VS = vga_vs_raw;
++assign VGA_DE = vga_de_b;
+ assign VGA_F1   =  status[14] ? 1'b0 : video_aspect.interlace;
+ assign VGA_SL = 0;
+ logic [11:0] aspect_x, aspect_y;
+@@ -1552,7 +1594,7 @@ wire [1:0] ar = status[33:32];
+ video_freak video_freak
+ (
+ 	.*,
+-	.VGA_DE_IN(VGA_DE),
++	.VGA_DE_IN(vga_de_raw),
+ 	.VGA_DE(),
+ 
+ 	.ARX((!ar) ? ((status[54:53] == 1) ? 3 : (status[54:53] == 2) ? 5 : (status[54:53] == 3) ? 16 : status[11] ? 12'd2 : aspect_x) : (ar - 1'd1)),
+@@ -1983,3 +2025,93 @@ begin
+ end
+ 
+ endmodule
++
++//------------------------------------------------------------------------------
++// Sinden Border Overlay (Option A): overwrite edge pixels inside active video
++//------------------------------------------------------------------------------
++module sinden_border_overlay #(
++    parameter int X_BITS = 12,
++    parameter int Y_BITS = 12
++)(
++    input  logic        clk,
++    input  logic        ce_pix,
++    input  logic        hs,
++    input  logic        vs,
++    input  logic        de_in,
++    input  logic [7:0]  r_in,
++    input  logic [7:0]  g_in,
++    input  logic [7:0]  b_in,
++
++    input  logic        border_en,
++    input  logic [3:0]  border_px,
++
++    output logic        de_out,
++    output logic [7:0]  r_out,
++    output logic [7:0]  g_out,
++    output logic [7:0]  b_out
++);
++
++    // Edge detect HS/VS rising edges
++    logic hs_d, vs_d;
++    always_ff @(posedge clk) if (ce_pix) begin
++        hs_d <= hs;
++        vs_d <= vs;
++    end
++    wire hs_rise =  hs & ~hs_d;
++    wire vs_rise =  vs & ~vs_d;
++
++    // Track x/y within active region
++    logic [X_BITS-1:0] x;
++    logic [Y_BITS-1:0] y;
++    logic [X_BITS-1:0] act_w;
++    logic [Y_BITS-1:0] act_h;
++
++    // DE falling edge to latch width and increment y
++    logic de_d;
++    always_ff @(posedge clk) if (ce_pix) de_d <= de_in;
++    wire de_fall = ~de_in & de_d;
++
++    always_ff @(posedge clk) if (ce_pix) begin
++        // New frame
++        if (vs_rise) begin
++            act_h <= y;
++            y     <= '0;
++        end
++
++        // New line
++        if (hs_rise) begin
++            x <= '0;
++        end else if (de_in) begin
++            x <= x + 1'd1;
++        end
++
++        // End of active line
++        if (de_fall) begin
++            act_w <= x;      // approximate active width
++            y     <= y + 1'd1;
++        end
++    end
++
++    // Avoid underflow before first measurement
++    wire [X_BITS-1:0] w = (act_w == '0) ? {X_BITS{1'b1}} : act_w;
++    wire [Y_BITS-1:0] h = (act_h == '0) ? {Y_BITS{1'b1}} : act_h;
++
++    wire in_border =
++        (x < border_px) ||
++        (x >= (w - border_px)) ||
++        (y < border_px) ||
++        (y >= (h - border_px));
++
++    always_comb begin
++        de_out = de_in;
++        if (border_en && de_in && in_border) begin
++            r_out = 8'hFF;
++            g_out = 8'hFF;
++            b_out = 8'hFF;
++        end else begin
++            r_out = r_in;
++            g_out = g_in;
++            b_out = b_in;
++        end
++    end
++endmodule
