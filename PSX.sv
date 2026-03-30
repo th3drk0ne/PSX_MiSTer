@@ -387,8 +387,8 @@ parameter CONF_STR = {
 	"P1-;",
 	"P1O[33:32],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"P1O[35:34],Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
-	"P1O[95:94],Sinden Border,Off,Auto,On;",
-	"P1O[98:96],Sinden Border Width,1,2,3,4,5,6,7,8;",
+	"P1O[95],Sinden Border,Off,On;",
+	"P1O[97:96],Sinden Border Width,1.5x,1x,2x;",
 	"P1-;",
 	"DEP1O[62],Fixed HBlank,On,Off;",
 	"DEP1O[55],Fixed VBlank,Off,On;",
@@ -882,7 +882,6 @@ wire PadPortJustif2  = (status[52:49] == 4'b1001);
 wire snacPort2       = (status[52:49] == 4'b1010) && ~multitap;
 wire PadPortStick2   = (status[52:49] == 4'b1011);
 wire PadPortPopn2    = (status[52:49] == 4'b1100);
-wire sinden_border_need = PadPortGunCon1 | PadPortGunCon2 | snacPort1 | snacPort2;
 
 reg paddleMode = 0;
 reg paddleMin = 0;
@@ -1543,12 +1542,8 @@ vid_info video_gamma;
 
 assign CE_PIXEL = ce_pix;
 
-// --- Sinden border controls (Off/Auto/On + thickness 1..8)
-wire [1:0] sinden_border_mode = status[95:94];               // 0=Off, 1=Auto, 2=On, 3=On
-wire [3:0] sinden_border_px   = {1'b0, status[98:96]} + 4'd1; // 1..8
-wire sinden_border_en_eff     =
-    sinden_border_mode[1] ? 1'b1 :                            // 2 or 3 => On
-    (sinden_border_mode[0] ? sinden_border_need : 1'b0);       // 1 => Auto, 0 => Off
+// --- Sinden border controls (Off/On)
+wire sinden_border_en_eff = status[95];
 
 // Raw (pre-border) VGA from gamma stage
 wire [7:0] vga_r_raw  = video_gamma.red;
@@ -1562,21 +1557,23 @@ wire       vga_de_raw = ~(video_gamma.vb | video_gamma.hb);
 wire [7:0] vga_r_b, vga_g_b, vga_b_b;
 wire       vga_de_b;
 
+wire [1:0] sinden_border_lvl = status[97:96];
+
 sinden_border_overlay border_i (
-    .clk       (CLK_VIDEO),
-    .ce_pix    (CE_PIXEL),
-    .hs        (vga_hs_raw),
-    .vs        (vga_vs_raw),
-    .de_in     (vga_de_raw),
-    .r_in      (vga_r_raw),
-    .g_in      (vga_g_raw),
-    .b_in      (vga_b_raw),
-    .border_en (sinden_border_en_eff),
-    .border_px (sinden_border_px),
-    .de_out    (vga_de_b),
-    .r_out     (vga_r_b),
-    .g_out     (vga_g_b),
-    .b_out     (vga_b_b)
+	.clk       (CLK_VIDEO),
+	.ce_pix    (CE_PIXEL),
+	.hs        (vga_hs_raw),
+	.vs        (vga_vs_raw),
+	.de_in     (vga_de_raw),
+	.r_in      (vga_r_raw),
+	.g_in      (vga_g_raw),
+	.b_in      (vga_b_raw),
+	.border_en (sinden_border_en_eff),
+	.border_lvl(sinden_border_lvl),
+	.de_out    (vga_de_b),
+	.r_out     (vga_r_b),
+	.g_out     (vga_g_b),
+	.b_out     (vga_b_b)
 );
 
 // Final outputs (timing unchanged)
@@ -2027,7 +2024,7 @@ end
 endmodule
 
 //------------------------------------------------------------------------------
-// Sinden Border Overlay (Option A): overwrite edge pixels inside active video
+// Sinden Border Overlay overwrite edge pixels inside active video
 //------------------------------------------------------------------------------
 module sinden_border_overlay #(
     parameter int X_BITS = 12,
@@ -2043,7 +2040,7 @@ module sinden_border_overlay #(
     input  logic [7:0]  b_in,
 
     input  logic        border_en,
-    input  logic [3:0]  border_px,
+    input  logic [1:0]  border_lvl,
 
     output logic        de_out,
     output logic [7:0]  r_out,
@@ -2059,6 +2056,24 @@ module sinden_border_overlay #(
     end
     wire hs_rise =  hs & ~hs_d;
     wire vs_rise =  vs & ~vs_d;
+
+    // Sync + latch enable + level on frame boundary (stable for full frame)
+    logic ben_d1, ben_d2;
+    logic [1:0] lvl_d1, lvl_d2;
+    logic border_active;
+    logic [1:0] lvl_active;
+
+    always_ff @(posedge clk) if (ce_pix) begin
+        ben_d1 <= border_en;
+        ben_d2 <= ben_d1;
+        lvl_d1 <= border_lvl;
+        lvl_d2 <= lvl_d1;
+
+        if (vs_rise) begin
+            border_active <= ben_d2;
+            lvl_active    <= lvl_d2;
+        end
+    end
 
     // Track x/y within active region
     logic [X_BITS-1:0] x;
@@ -2096,15 +2111,64 @@ module sinden_border_overlay #(
     wire [X_BITS-1:0] w = (act_w == '0) ? {X_BITS{1'b1}} : act_w;
     wire [Y_BITS-1:0] h = (act_h == '0) ? {Y_BITS{1'b1}} : act_h;
 
+    // Base (default) width from your existing auto rules
+    wire [6:0] base_h_raw = w / 7'd80; // left/right base width
+    wire [6:0] base_v_raw = h / 7'd40; // top/bottom base width
+
+    // Scale base width by lvl_active:
+	// 0: 1.5x (default)
+	// 1: 1.0x
+	// 2: 2.0x (3 treated as 2.0x)
+    logic [7:0] scaled_h_raw;
+    logic [7:0] scaled_v_raw;
+
+	always_comb begin
+		unique case (lvl_active)
+			2'd0: begin // 1.5x (default, menu index 0)
+				scaled_h_raw = (base_h_raw * 3 + 1) >> 1;
+				scaled_v_raw = (base_v_raw * 3 + 1) >> 1;
+			end
+			2'd1: begin // 1x (menu index 1)
+				scaled_h_raw = base_h_raw;
+				scaled_v_raw = base_v_raw;
+			end
+			default: begin // 2x (menu index 2, also covers 3 safely)
+				scaled_h_raw = (base_h_raw << 1);
+				scaled_v_raw = (base_v_raw << 1);
+			end
+		endcase
+	end
+
+
+    // Clamp AFTER scaling so 0.5x and 2x behave as expected
+    // Default mins were 8/12; half of that is 4/6. Max doubled from 32/48 -> 64/96.
+	wire [6:0] border_px_h = (scaled_h_raw < 7'd4)  ? 7'd4  :
+							 (scaled_h_raw > 7'd64) ? 7'd64 : scaled_h_raw[6:0];
+
+	wire [6:0] border_px_v = (scaled_v_raw < 7'd6)  ? 7'd6  :
+							 (scaled_v_raw > 7'd96) ? 7'd96 : scaled_v_raw[6:0];
+
+	// Prevent "border >= width/height" issues WITHOUT truncating width/height
+    wire [X_BITS-1:0] half_w = (w >> 1);
+    wire [Y_BITS-1:0] half_h = (h >> 1);
+
+    wire [X_BITS-1:0] border_px_h_ext = {{(X_BITS-7){1'b0}}, border_px_h};
+    wire [Y_BITS-1:0] border_px_v_ext = {{(Y_BITS-7){1'b0}}, border_px_v};
+
+    wire [6:0] border_px_h_eff = (border_px_h_ext > half_w) ? half_w[6:0] : border_px_h;
+    wire [6:0] border_px_v_eff = (border_px_v_ext > half_h) ? half_h[6:0] : border_px_v;
+	
     wire in_border =
-        (x < border_px) ||
-        (x >= (w - border_px)) ||
-        (y < border_px) ||
-        (y >= (h - border_px));
+        (x < border_px_h_eff) ||
+        (x >= (w - border_px_h_eff)) ||
+        (y < border_px_v_eff) ||
+        (y >= (h - border_px_v_eff));
+	
 
     always_comb begin
         de_out = de_in;
-        if (border_en && de_in && in_border) begin
+
+        if (border_active && de_in && in_border) begin
             r_out = 8'hFF;
             g_out = 8'hFF;
             b_out = 8'hFF;
@@ -2114,4 +2178,5 @@ module sinden_border_overlay #(
             b_out = b_in;
         end
     end
+
 endmodule
